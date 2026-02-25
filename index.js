@@ -16,18 +16,17 @@ const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
 // Simple in-memory store; replace with a real DB later if you want
 const savedFiles = [];
 
-// Call Perplexity (chat completions)
+// Call Perplexity (Chat Completions API)
 async function askPerplexity(prompt) {
-  const url = 'https://api.perplexity.ai/chat/completions'; // chat completions endpoint[web:129]
+  const url = 'https://api.perplexity.ai/chat/completions'; // correct endpoint[web:129][web:222]
 
   const headers = {
     Authorization: `Bearer ${PPLX_API_KEY}`,
     'Content-Type': 'application/json',
-    Accept: 'application/json',
   };
 
   const data = {
-    model: 'sonar', // valid Perplexity chat model[web:129]
+    model: 'sonar', // valid Perplexity chat model[web:129][web:126]
     messages: [
       { role: 'system', content: 'You are a helpful assistant.' },
       { role: 'user', content: prompt },
@@ -39,7 +38,10 @@ async function askPerplexity(prompt) {
     console.log('Perplexity raw data:', JSON.stringify(res.data, null, 2));
     return res.data.choices?.[0]?.message?.content || 'No response from Perplexity.';
   } catch (err) {
-    console.error('Perplexity error:', err.response?.data || err.message || err);
+    console.error(
+      'Perplexity error:',
+      err.response?.data || err.response?.status || err.message || err
+    );
     throw err;
   }
 }
@@ -61,7 +63,6 @@ async function sendTelegramMessage(chatId, text) {
 // Download a Telegram file and save it locally
 async function downloadAndSaveTelegramFile(fileId, originalFileName = 'file.bin') {
   try {
-    // 1) Ask Telegram for file_path
     const getFileUrl = `${TELEGRAM_API}/getFile`;
     const fileInfoRes = await axios.get(getFileUrl, {
       params: { file_id: fileId },
@@ -74,23 +75,19 @@ async function downloadAndSaveTelegramFile(fileId, originalFileName = 'file.bin'
     const filePath = fileInfoRes.data.result.file_path;
     console.log('Telegram file_path:', filePath);
 
-    // 2) Build download URL
     const downloadUrl = `https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${filePath}`;
     console.log('Download URL:', downloadUrl);
 
-    // 3) Ensure downloads directory exists
     const downloadsDir = path.join(__dirname, 'downloads');
     if (!fs.existsSync(downloadsDir)) {
       fs.mkdirSync(downloadsDir);
     }
 
-    // 4) Choose local filename
     const ext = path.extname(filePath) || path.extname(originalFileName) || '';
     const baseName = path.basename(originalFileName, ext) || 'file';
     const localFileName = `${baseName}-${Date.now()}${ext}`;
     const localFilePath = path.join(downloadsDir, localFileName);
 
-    // 5) Download and stream to file
     const response = await axios.get(downloadUrl, { responseType: 'stream' });
     const writer = fs.createWriteStream(localFilePath);
 
@@ -104,7 +101,10 @@ async function downloadAndSaveTelegramFile(fileId, originalFileName = 'file.bin'
     console.log('Saved file to:', localFilePath);
     return localFilePath;
   } catch (err) {
-    console.error('downloadAndSaveTelegramFile error:', err.response?.data || err.message || err);
+    console.error(
+      'downloadAndSaveTelegramFile error:',
+      err.response?.data || err.message || err
+    );
     throw err;
   }
 }
@@ -120,7 +120,6 @@ app.post('/webhook', async (req, res) => {
       const msg = update.message;
       const chatId = msg.chat.id;
 
-      // If message has a document (file)
       if (msg.document) {
         const doc = msg.document;
         const fileId = doc.file_id;
@@ -128,7 +127,6 @@ app.post('/webhook', async (req, res) => {
 
         console.log('Received document:', fileName, 'file_id:', fileId);
 
-        // Store metadata in memory
         savedFiles.push({
           chatId,
           fileId,
@@ -137,7 +135,6 @@ app.post('/webhook', async (req, res) => {
         });
         console.log('Current savedFiles:', savedFiles);
 
-        // Download and save file
         try {
           const localPath = await downloadAndSaveTelegramFile(fileId, fileName);
           await sendTelegramMessage(
@@ -148,8 +145,6 @@ app.post('/webhook', async (req, res) => {
           console.error('Error saving file:', err);
           await sendTelegramMessage(chatId, 'Sorry, I could not save your file.');
         }
-
-      // If message has text → Perplexity
       } else if (msg.text) {
         const text = msg.text;
         console.log('User text:', text);
