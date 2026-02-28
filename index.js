@@ -1,180 +1,129 @@
 // index.js
-require('dotenv').config();
-const express = require('express');
-const bodyParser = require('body-parser');
-const axios = require('axios');
-const fs = require('fs');
-const path = require('path');
 
-const app = express();
-app.use(bodyParser.json());
+// Load .env only in local dev, not on Railway
+if (process.env.NODE_ENV !== "production") {
+  require("dotenv").config();
+}
 
-const PPLX_API_KEY = process.env.PPLX_API_KEY;
+const express = require("express");
+const TelegramBot = require("node-telegram-bot-api");
+const fetch = require("node-fetch");
+
+// ----- Environment variables -----
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const TELEGRAM_API = `https://api.telegram.org/bot$8732199574:AAH9cV7QriantDMtrPbYSENp7CEUZkVtLcg`;
+const PPLX_API_KEY = process.env.PPLX_API_KEY;
+const SERVER_URL = process.env.SERVER_URL; // e.g. https://your-app.up.railway.app
 
-// Simple in-memory store; replace with a real DB later if you want
-const savedFiles = [];
+if (!TELEGRAM_BOT_TOKEN) {
+  console.error("Missing TELEGRAM_BOT_TOKEN env var");
+  process.exit(1);
+}
+if (!PPLX_API_KEY) {
+  console.error("Missing PPLX_API_KEY env var");
+  process.exit(1);
+}
+if (!SERVER_URL) {
+  console.error("Missing SERVER_URL env var (Railway public URL)");
+  process.exit(1);
+}
 
-// Call Perplexity (Chat Completions API)
-async function askPerplexity(prompt) {
-  const url = 'https://api.perplexity.ai/chat/completions'; // correct endpoint[web:129][web:222]
+// ----- Telegram bot setup (webhook, no polling) -----
+const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: false });
 
-  const headers = {
-  Authorization: `Bearer ${PPLX_API_KEY}`,
-  'Content-Type': 'application/json',
-};
+// Webhook path is unique per bot
+const WEBHOOK_PATH = `/webhook/${TELEGRAM_BOT_TOKEN}`;
+const WEBHOOK_URL = `${SERVER_URL}${WEBHOOK_PATH}`;
 
+// Set webhook at startup
+bot
+  .setWebHook(WEBHOOK_URL)
+  .then(() => console.log("Telegram webhook set:", WEBHOOK_URL))
+  .catch((err) => {
+    console.error("Failed to set Telegram webhook:", err);
+    process.exit(1);
+  });
 
-  const data = {
-    model: 'sonar', // valid Perplexity chat model[web:129][web:126]
-    messages: [
-      { role: 'system', content: 'You are a helpful assistant.' },
-      { role: 'user', content: prompt },
-    ],
-  };
+// ----- Express app -----
+const app = express();
+app.use(express.json());
 
-  try {
-    const res = await axios.post(url, data, { headers });
-    console.log('Perplexity raw data:', JSON.stringify(res.data, null, 2));
-    return res.data.choices?.[0]?.message?.content || 'No response from Perplexity.';
-  } catch (err) {
-    console.error(
-      'Perplexity error:',
-      err.response?.data || err.response?.status || err.message || err
+// Telegram will POST updates to this route
+app.post(WEBHOOK_PATH, (req, res) => {
+  bot.processUpdate(req.body);
+  res.sendStatus(200);
+});
+
+// Simple health check
+app.get("/", (req, res) => {
+  res.send("Telegram + Perplexity bot is running");
+});
+
+// ----- Bot behavior -----
+bot.on("message", async (msg) => {
+  const chatId = msg.chat.id;
+  const text = msg.text || "";
+
+  // Basic /start
+  if (text === "/start") {
+    await bot.sendMessage(
+      chatId,
+      "Hi! Send me a question and I’ll ask Perplexity for an answer."
     );
-    throw err;
+    return;
   }
-}
 
-// Send a message to Telegram
-async function sendTelegramMessage(chatId, text) {
-  try {
-    const res = await axios.post(`${TELEGRAM_API}/sendMessage`, {
-      chat_id: chatId,
-      text,
-    });
-    console.log('Telegram send response:', res.data);
-  } catch (err) {
-    console.error('Telegram send error:', err.response?.data || err.message || err);
-    throw err;
+  // Ignore empty messages
+  if (!text.trim()) {
+    await bot.sendMessage(chatId, "Please send some text.");
+    return;
   }
-}
 
-// Download a Telegram file and save it locally
-async function downloadAndSaveTelegramFile(fileId, originalFileName = 'file.bin') {
+  // Call Perplexity API
   try {
-    const getFileUrl = `${TELEGRAM_API}/getFile`;
-    const fileInfoRes = await axios.get(getFileUrl, {
-      params: { file_id: fileId },
+    await bot.sendChatAction(chatId, "typing");
+
+    const response = await fetch("https://api.perplexity.ai/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${PPLX_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: "sonar",
+        messages: [
+          { role: "system", content: "You are a helpful Telegram assistant." },
+          { role: "user", content: text },
+        ],
+      }),
     });
 
-    if (!fileInfoRes.data.ok) {
-      throw new Error('getFile failed: ' + JSON.stringify(fileInfoRes.data));
+    if (!response.ok) {
+      console.error("Perplexity API error:", await response.text());
+      await bot.sendMessage(
+        chatId,
+        "Sorry, I had an issue talking to the AI. Try again later."
+      );
+      return;
     }
 
-    const filePath = fileInfoRes.data.result.file_path;
-    console.log('Telegram file_path:', filePath);
+    const data = await response.json();
+    const answer =
+      data.choices?.[0]?.message?.content?.trim() ||
+      "I couldn't generate a response.";
 
-    const downloadUrl = `https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${filePath}`;
-    console.log('Download URL:', downloadUrl);
-
-    const downloadsDir = path.join(__dirname, 'downloads');
-    if (!fs.existsSync(downloadsDir)) {
-      fs.mkdirSync(downloadsDir);
-    }
-
-    const ext = path.extname(filePath) || path.extname(originalFileName) || '';
-    const baseName = path.basename(originalFileName, ext) || 'file';
-    const localFileName = `${baseName}-${Date.now()}${ext}`;
-    const localFilePath = path.join(downloadsDir, localFileName);
-
-    const response = await axios.get(downloadUrl, { responseType: 'stream' });
-    const writer = fs.createWriteStream(localFilePath);
-
-    response.data.pipe(writer);
-
-    await new Promise((resolve, reject) => {
-      writer.on('finish', resolve);
-      writer.on('error', reject);
-    });
-
-    console.log('Saved file to:', localFilePath);
-    return localFilePath;
+    await bot.sendMessage(chatId, answer, { parse_mode: "Markdown" });
   } catch (err) {
-    console.error(
-      'downloadAndSaveTelegramFile error:',
-      err.response?.data || err.message || err
+    console.error("Error handling message:", err);
+    await bot.sendMessage(
+      chatId,
+      "Sorry, something went wrong while processing your message."
     );
-    throw err;
-  }
-}
-
-// Webhook endpoint for Telegram
-app.post('/webhook', async (req, res) => {
-  try {
-    console.log('Incoming update:', JSON.stringify(req.body, null, 2));
-
-    const update = req.body;
-
-    if (update.message) {
-      const msg = update.message;
-      const chatId = msg.chat.id;
-
-      if (msg.document) {
-        const doc = msg.document;
-        const fileId = doc.file_id;
-        const fileName = doc.file_name || 'file.bin';
-
-        console.log('Received document:', fileName, 'file_id:', fileId);
-
-        savedFiles.push({
-          chatId,
-          fileId,
-          fileName,
-          date: new Date().toISOString(),
-        });
-        console.log('Current savedFiles:', savedFiles);
-
-        try {
-          const localPath = await downloadAndSaveTelegramFile(fileId, fileName);
-          await sendTelegramMessage(
-            chatId,
-            `File saved.\nOriginal name: ${fileName}\nStored at: ${localPath}`
-          );
-        } catch (err) {
-          console.error('Error saving file:', err);
-          await sendTelegramMessage(chatId, 'Sorry, I could not save your file.');
-        }
-      } else if (msg.text) {
-        const text = msg.text;
-        console.log('User text:', text);
-
-        const reply = await askPerplexity(text);
-        console.log('Perplexity reply:', reply);
-
-        await sendTelegramMessage(chatId, reply);
-        console.log('Sent reply to Telegram');
-      } else {
-        console.log('Message has no text and no document');
-        await sendTelegramMessage(
-          chatId,
-          'I can handle text messages and document files (like PDFs) right now.'
-        );
-      }
-    } else {
-      console.log('No message field in update');
-    }
-
-    res.sendStatus(200);
-  } catch (err) {
-    console.error('Webhook error:', err.response?.data || err.message || err);
-    res.sendStatus(500);
   }
 });
 
-// Start server
+// ----- Start server on Railway-assigned port -----
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Bot server running on port ${PORT}`);
+  console.log(`Server running on port ${PORT}`);
+  console.log("Webhook URL:", WEBHOOK_URL);
 });
