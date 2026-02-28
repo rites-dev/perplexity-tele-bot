@@ -99,13 +99,70 @@ app.post(WEBHOOK_PATH, async (req, res) => {
 
     console.log("Incoming Telegram update:", JSON.stringify(update));
 
-    if (!update.message || !update.message.text) {
+    const message = update.message;
+    if (!message) {
       return res.sendStatus(200);
     }
 
-    const chatId = update.message.chat.id;
-    const text = update.message.text.trim();
+    const chatId = message.chat.id;
+    const text = (message.text || "").trim();
 
+    // 1) Handle documents (files)
+    if (message.document) {
+      const doc = message.document;
+      const fileId = doc.file_id;
+      const originalName = doc.file_name || `${fileId}.bin`;
+
+      try {
+        const localPath = await downloadTelegramFile(fileId, originalName);
+        await sendTelegramMessage(
+          chatId,
+          `I saved your file as \`${path.basename(localPath)}\` on the server.`
+        );
+      } catch (err) {
+        console.error("Failed to download/save document:", err);
+        await sendTelegramMessage(
+          chatId,
+          "I got your file but failed to save it. Please try again later."
+        );
+      }
+
+      return res.sendStatus(200);
+    }
+
+    // 2) Handle photos (save highest-resolution variant)
+    if (message.photo && Array.isArray(message.photo) && message.photo.length > 0) {
+      const bestPhoto = message.photo[message.photo.length - 1];
+      const fileId = bestPhoto.file_id;
+      const originalName = `photo_${fileId}.jpg`;
+
+      try {
+        const localPath = await downloadTelegramFile(fileId, originalName);
+        await sendTelegramMessage(
+          chatId,
+          `I saved your photo as \`${path.basename(localPath)}\` on the server.`
+        );
+      } catch (err) {
+        console.error("Failed to download/save photo:", err);
+        await sendTelegramMessage(
+          chatId,
+          "I got your photo but failed to save it. Please try again later."
+        );
+      }
+
+      return res.sendStatus(200);
+    }
+
+    // 3) If no text and no file-like content
+    if (!text) {
+      await sendTelegramMessage(
+        chatId,
+        "I can respond to text, documents, and photos. Try sending a message or a file."
+      );
+      return res.sendStatus(200);
+    }
+
+    // 4) Normal text flow with Perplexity
     if (text === "/start") {
       await sendTelegramMessage(
         chatId,
@@ -114,17 +171,12 @@ app.post(WEBHOOK_PATH, async (req, res) => {
       return res.sendStatus(200);
     }
 
-    if (!text) {
-      await sendTelegramMessage(chatId, "Please send some text.");
-      return res.sendStatus(200);
-    }
-
     await sendChatAction(chatId, "typing");
 
     const answer = await askPerplexity(text);
     await sendTelegramMessage(chatId, answer);
 
-    // Log each question to a file in /data
+    // Log each text question to a file in /data
     try {
       const logFile = path.join(DATA_DIR, "messages.log");
       const line = `[${new Date().toISOString()}] chat:${chatId} text:${JSON.stringify(
@@ -221,6 +273,50 @@ async function askPerplexity(prompt) {
     console.error("Error calling Perplexity:", err);
     return "Sorry, something went wrong while contacting the AI.";
   }
+}
+
+// ----- Telegram file download helper -----
+
+async function downloadTelegramFile(fileId, suggestedName) {
+  // Step 1: getFile to obtain file_path
+  const getFileUrl = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getFile?file_id=${fileId}`;
+
+  const metaRes = await fetch(getFileUrl);
+  const meta = await metaRes.json();
+
+  if (!meta.ok || !meta.result || !meta.result.file_path) {
+    console.error("getFile failed:", meta);
+    throw new Error("Failed to get file_path from Telegram");
+  }
+
+  const filePath = meta.result.file_path; // e.g. "documents/file_1234.pdf"
+  const downloadUrl = `https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${filePath}`;
+
+  console.log("Downloading Telegram file from:", downloadUrl);
+
+  // Step 2: download the file as binary
+  const fileRes = await fetch(downloadUrl);
+  if (!fileRes.ok) {
+    throw new Error(
+      `Failed to download file: ${fileRes.status} ${fileRes.statusText}`
+    );
+  }
+
+  const buffer = await fileRes.buffer();
+
+  // Step 3: save to DATA_DIR
+  const safeName = suggestedName.replace(/[^\w.\-]/g, "_");
+  const localPath = path.join(DATA_DIR, safeName);
+
+  fs.writeFileSync(localPath, buffer);
+  console.log("Saved Telegram file to:", localPath);
+
+  // Optional: mirror to OneDrive if configured
+  if (ONEDRIVE_CLIENT_ID && ONEDRIVE_TENANT_ID && ONEDRIVE_CLIENT_SECRET) {
+    await uploadFileToOneDrive(localPath, safeName);
+  }
+
+  return localPath;
 }
 
 // ----- OneDrive helpers -----
