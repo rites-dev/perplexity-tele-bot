@@ -12,10 +12,18 @@ const path = require("path");
 // ----- Environment variables -----
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const PPLX_API_KEY = process.env.PPLX_API_KEY;
-const SERVER_URL = process.env.SERVER_URL; // e.g. https://your-app.up.railway.app
+
+// Public URL for your Railway app (no trailing slash)
+const PUBLIC_URL = "https://perplexity-tele-bot-production.up.railway.app";
 
 // Directory for persistent files (Railway Volume mounted at /data)
 const DATA_DIR = process.env.DATA_DIR || "/data";
+
+// Optional OneDrive config
+const ONEDRIVE_CLIENT_ID = process.env.ONEDRIVE_CLIENT_ID;
+const ONEDRIVE_TENANT_ID = process.env.ONEDRIVE_TENANT_ID;
+const ONEDRIVE_CLIENT_SECRET = process.env.ONEDRIVE_CLIENT_SECRET;
+const ONEDRIVE_FOLDER_PATH = process.env.ONEDRIVE_FOLDER_PATH || "/TelegramBot";
 
 if (!TELEGRAM_BOT_TOKEN) {
   console.error("Missing TELEGRAM_BOT_TOKEN env var");
@@ -25,12 +33,8 @@ if (!PPLX_API_KEY) {
   console.error("Missing PPLX_API_KEY env var");
   process.exit(1);
 }
-if (!SERVER_URL) {
-  console.error("Missing SERVER_URL env var (your Railway public URL)");
-  process.exit(1);
-}
 
-// Ensure data directory exists (best-effort)
+// Ensure data directory exists
 try {
   if (!fs.existsSync(DATA_DIR)) {
     fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -40,10 +44,9 @@ try {
   console.error("Failed to prepare DATA_DIR:", err);
 }
 
-// Log vars (without exposing secrets)
 console.log("TELEGRAM_BOT_TOKEN present?", !!TELEGRAM_BOT_TOKEN);
 console.log("PPLX_API_KEY present?", !!PPLX_API_KEY);
-console.log("SERVER_URL:", SERVER_URL);
+console.log("PUBLIC_URL:", PUBLIC_URL);
 
 // ----- Express app -----
 const app = express();
@@ -56,7 +59,7 @@ app.get("/health", (req, res) => {
 
 // Simple save route to test file writes:
 // POST /save { "filename": "test.json", "data": { "foo": "bar" } }
-app.post("/save", (req, res) => {
+app.post("/save", async (req, res) => {
   const { filename, data } = req.body || {};
   if (!filename || !data) {
     return res.status(400).json({ error: "filename and data are required" });
@@ -66,6 +69,11 @@ app.post("/save", (req, res) => {
   try {
     fs.writeFileSync(filePath, JSON.stringify(data, null, 2), "utf8");
     console.log("Saved file:", filePath);
+
+    if (ONEDRIVE_CLIENT_ID && ONEDRIVE_TENANT_ID && ONEDRIVE_CLIENT_SECRET) {
+      await uploadFileToOneDrive(filePath, filename);
+    }
+
     return res.status(200).json({ ok: true, path: filePath });
   } catch (err) {
     console.error("Error writing file:", err);
@@ -75,7 +83,7 @@ app.post("/save", (req, res) => {
 
 // Webhook config
 const WEBHOOK_PATH = `/webhook/${TELEGRAM_BOT_TOKEN}`;
-const WEBHOOK_URL = `${SERVER_URL}${WEBHOOK_PATH}`;
+const WEBHOOK_URL = `${PUBLIC_URL}${WEBHOOK_PATH}`;
 
 console.log("Webhook will be set to:", WEBHOOK_URL);
 
@@ -116,13 +124,17 @@ app.post(WEBHOOK_PATH, async (req, res) => {
     const answer = await askPerplexity(text);
     await sendTelegramMessage(chatId, answer);
 
-    // Example: log each question to a file in /data
+    // Log each question to a file in /data
     try {
       const logFile = path.join(DATA_DIR, "messages.log");
       const line = `[${new Date().toISOString()}] chat:${chatId} text:${JSON.stringify(
         text
       )}\n`;
       fs.appendFileSync(logFile, line, "utf8");
+
+      if (ONEDRIVE_CLIENT_ID && ONEDRIVE_TENANT_ID && ONEDRIVE_CLIENT_SECRET) {
+        await uploadFileToOneDrive(logFile, "messages.log");
+      }
     } catch (err) {
       console.error("Failed to append to log file:", err);
     }
@@ -208,6 +220,61 @@ async function askPerplexity(prompt) {
   } catch (err) {
     console.error("Error calling Perplexity:", err);
     return "Sorry, something went wrong while contacting the AI.";
+  }
+}
+
+// ----- OneDrive helpers -----
+
+async function getOneDriveAccessToken() {
+  if (!ONEDRIVE_CLIENT_ID || !ONEDRIVE_TENANT_ID || !ONEDRIVE_CLIENT_SECRET) {
+    throw new Error("OneDrive env vars not set");
+  }
+
+  const tokenUrl = `https://login.microsoftonline.com/${ONEDRIVE_TENANT_ID}/oauth2/v2.0/token`;
+  const params = new URLSearchParams();
+  params.append("client_id", ONEDRIVE_CLIENT_ID);
+  params.append("client_secret", ONEDRIVE_CLIENT_SECRET);
+  params.append("grant_type", "client_credentials");
+  params.append("scope", "https://graph.microsoft.com/.default");
+
+  const res = await fetch(tokenUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: params.toString(),
+  });
+
+  const data = await res.json();
+  if (!res.ok) {
+    console.error("OneDrive token error:", data);
+    throw new Error("Failed to get OneDrive token");
+  }
+  return data.access_token;
+}
+
+async function uploadFileToOneDrive(localPath, remoteFileName) {
+  try {
+    const token = await getOneDriveAccessToken();
+    const fileBuffer = fs.readFileSync(localPath);
+
+    const uploadUrl = `https://graph.microsoft.com/v1.0/me/drive/root:${ONEDRIVE_FOLDER_PATH}/${remoteFileName}:/content`;
+
+    const res = await fetch(uploadUrl, {
+      method: "PUT",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/octet-stream",
+      },
+      body: fileBuffer,
+    });
+
+    const data = await res.json();
+    if (!res.ok) {
+      console.error("OneDrive upload error:", data);
+    } else {
+      console.log("Uploaded to OneDrive:", data.name);
+    }
+  } catch (err) {
+    console.error("Failed to upload to OneDrive:", err);
   }
 }
 
