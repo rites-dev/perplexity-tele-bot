@@ -1,17 +1,21 @@
 // index.js
 
-// Load .env only in local dev
 if (process.env.NODE_ENV !== "production") {
   require("dotenv").config();
 }
 
 const express = require("express");
 const fetch = require("node-fetch");
+const fs = require("fs");
+const path = require("path");
 
 // ----- Environment variables -----
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const PPLX_API_KEY = process.env.PPLX_API_KEY;
 const SERVER_URL = process.env.SERVER_URL; // e.g. https://your-app.up.railway.app
+
+// Directory for persistent files (Railway Volume mounted at /data)
+const DATA_DIR = process.env.DATA_DIR || "/data";
 
 if (!TELEGRAM_BOT_TOKEN) {
   console.error("Missing TELEGRAM_BOT_TOKEN env var");
@@ -26,6 +30,16 @@ if (!SERVER_URL) {
   process.exit(1);
 }
 
+// Ensure data directory exists (best-effort)
+try {
+  if (!fs.existsSync(DATA_DIR)) {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+  }
+  console.log("DATA_DIR ready at:", DATA_DIR);
+} catch (err) {
+  console.error("Failed to prepare DATA_DIR:", err);
+}
+
 // Log vars (without exposing secrets)
 console.log("TELEGRAM_BOT_TOKEN present?", !!TELEGRAM_BOT_TOKEN);
 console.log("PPLX_API_KEY present?", !!PPLX_API_KEY);
@@ -35,9 +49,28 @@ console.log("SERVER_URL:", SERVER_URL);
 const app = express();
 app.use(express.json());
 
-// Health check endpoint (used by Railway healthcheck and cron/uptime pings)
+// Health check
 app.get("/health", (req, res) => {
   res.status(200).json({ status: "ok" });
+});
+
+// Simple save route to test file writes:
+// POST /save { "filename": "test.json", "data": { "foo": "bar" } }
+app.post("/save", (req, res) => {
+  const { filename, data } = req.body || {};
+  if (!filename || !data) {
+    return res.status(400).json({ error: "filename and data are required" });
+  }
+
+  const filePath = path.join(DATA_DIR, filename);
+  try {
+    fs.writeFileSync(filePath, JSON.stringify(data, null, 2), "utf8");
+    console.log("Saved file:", filePath);
+    return res.status(200).json({ ok: true, path: filePath });
+  } catch (err) {
+    console.error("Error writing file:", err);
+    return res.status(500).json({ error: "failed to write file" });
+  }
 });
 
 // Webhook config
@@ -56,7 +89,6 @@ app.post(WEBHOOK_PATH, async (req, res) => {
   try {
     const update = req.body;
 
-    // Temporary logging of all incoming updates
     console.log("Incoming Telegram update:", JSON.stringify(update));
 
     if (!update.message || !update.message.text) {
@@ -84,6 +116,17 @@ app.post(WEBHOOK_PATH, async (req, res) => {
     const answer = await askPerplexity(text);
     await sendTelegramMessage(chatId, answer);
 
+    // Example: log each question to a file in /data
+    try {
+      const logFile = path.join(DATA_DIR, "messages.log");
+      const line = `[${new Date().toISOString()}] chat:${chatId} text:${JSON.stringify(
+        text
+      )}\n`;
+      fs.appendFileSync(logFile, line, "utf8");
+    } catch (err) {
+      console.error("Failed to append to log file:", err);
+    }
+
     res.sendStatus(200);
   } catch (err) {
     console.error("Error in webhook handler:", err);
@@ -91,7 +134,7 @@ app.post(WEBHOOK_PATH, async (req, res) => {
   }
 });
 
-// ----- Telegram helper functions (raw HTTP API) -----
+// ----- Telegram helper functions -----
 
 async function sendTelegramMessage(chatId, text) {
   const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
@@ -117,7 +160,7 @@ async function sendChatAction(chatId, action) {
   const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendChatAction`;
   const body = {
     chat_id: chatId,
-    action, // e.g. "typing"
+    action,
   };
 
   const res = await fetch(url, {
@@ -192,6 +235,6 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Server running on port ${PORT}`);
   console.log("Webhook URL:", WEBHOOK_URL);
-  // Fire-and-forget: don't block startup
+  console.log("Data directory:", DATA_DIR);
   ensureWebhook();
 });
