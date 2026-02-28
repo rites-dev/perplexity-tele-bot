@@ -19,11 +19,12 @@ const PUBLIC_URL = "https://perplexity-tele-bot-production.up.railway.app";
 // Directory for persistent files (Railway Volume mounted at /data)
 const DATA_DIR = process.env.DATA_DIR || "/data";
 
-// OneDrive config (app-only auth, uploading into a specific user's drive)
+// OneDrive config (app-only auth, uploading into a specific Entra ID user's drive)
 const ONEDRIVE_CLIENT_ID = process.env.ONEDRIVE_CLIENT_ID;
 const ONEDRIVE_TENANT_ID = process.env.ONEDRIVE_TENANT_ID;
 const ONEDRIVE_CLIENT_SECRET = process.env.ONEDRIVE_CLIENT_SECRET;
-const ONEDRIVE_USER = process.env.ONEDRIVE_USER; // e.g. "your-email@outlook.com"
+// IMPORTANT: this must be an Entra user UPN or objectId in the tenant, e.g. "user@yourtenant.onmicrosoft.com"
+const ONEDRIVE_USER = process.env.ONEDRIVE_USER;
 const ONEDRIVE_FOLDER_PATH = process.env.ONEDRIVE_FOLDER_PATH || "/TelegramBot";
 
 if (!TELEGRAM_BOT_TOKEN) {
@@ -299,8 +300,8 @@ async function downloadTelegramFile(fileId, suggestedName) {
     throw new Error("Failed to get file_path from Telegram");
   }
 
-  const filePath = meta.result.file_path;
-  const downloadUrl = `https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${filePath}`;
+  const filePathTelegram = meta.result.file_path;
+  const downloadUrl = `https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${filePathTelegram}`;
 
   console.log("Downloading Telegram file from:", downloadUrl);
 
@@ -331,7 +332,7 @@ async function downloadTelegramFile(fileId, suggestedName) {
   return localPath;
 }
 
-// ----- OneDrive helpers -----
+// ----- OneDrive helpers (app-only to a specific Entra user) -----
 
 async function getOneDriveAccessToken() {
   if (
@@ -371,9 +372,14 @@ async function getOneDriveAccessToken() {
 
 async function uploadFileToOneDrive(localPath, remoteFileName) {
   try {
+    if (!ONEDRIVE_USER) {
+      throw new Error("ONEDRIVE_USER not set");
+    }
+
     const token = await getOneDriveAccessToken();
     const fileBuffer = fs.readFileSync(localPath);
 
+    // ONEDRIVE_USER must be a valid Entra user in the tenant (UPN or id)
     const uploadUrl = `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(
       ONEDRIVE_USER
     )}/drive/root:${ONEDRIVE_FOLDER_PATH}/${remoteFileName}:/content`;
