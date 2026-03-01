@@ -23,7 +23,7 @@ const DATA_DIR = process.env.DATA_DIR || "/data";
 const ONEDRIVE_CLIENT_ID = process.env.ONEDRIVE_CLIENT_ID;
 const ONEDRIVE_TENANT_ID = process.env.ONEDRIVE_TENANT_ID;
 const ONEDRIVE_CLIENT_SECRET = process.env.ONEDRIVE_CLIENT_SECRET;
-const ONEDRIVE_USER = process.env.ONEDRIVE_USER; // e.g. "your-email@outlook.com"
+const ONEDRIVE_USER = process.env.ONEDRIVE_USER; // UPN in your tenant
 const ONEDRIVE_FOLDER_PATH = process.env.ONEDRIVE_FOLDER_PATH || "/TelegramBot";
 
 if (!TELEGRAM_BOT_TOKEN) {
@@ -112,6 +112,38 @@ app.post(WEBHOOK_PATH, async (req, res) => {
 
     const chatId = message.chat.id;
     const text = (message.text || "").trim();
+
+    // ---- /mkdir command to create a folder in OneDrive ----
+    if (text.toLowerCase().startsWith("/mkdir")) {
+      const parts = text.split(" ").filter(Boolean);
+      if (parts.length < 2) {
+        await sendTelegramMessage(
+          chatId,
+          "Usage: /mkdir <folder_name>"
+        );
+        return res.sendStatus(200);
+      }
+
+      const folderName = parts
+        .slice(1)
+        .join("_")
+        .replace(/[^\w.\-]/g, "_");
+
+      try {
+        await createOneDriveFolder(folderName);
+        await sendTelegramMessage(
+          chatId,
+          `Created folder \`${folderName}\` in OneDrive under \`${ONEDRIVE_FOLDER_PATH}\`.`
+        );
+      } catch (err) {
+        await sendTelegramMessage(
+          chatId,
+          "I failed to create that folder. Check the logs for details."
+        );
+      }
+
+      return res.sendStatus(200);
+    }
 
     // Simple recall example for teacher's name
     if (
@@ -284,7 +316,6 @@ function categorizeMemory(text) {
 }
 
 // ----- Very simple memory recall from messages.log -----
-// Optional category filter: if provided, we prefer lines with that category.
 
 function recallFromLog(keyword, preferredCategory = null) {
   try {
@@ -521,6 +552,50 @@ async function uploadFileToOneDrive(localPath, remoteFileName) {
   }
 }
 
+// Create a OneDrive folder via .keep file
+async function createOneDriveFolder(folderName) {
+  try {
+    if (!ONEDRIVE_USER) throw new Error("ONEDRIVE_USER not set");
+
+    const token = await getOneDriveAccessToken();
+    const buffer = Buffer.from("folder placeholder");
+
+    const baseFolder = ONEDRIVE_FOLDER_PATH; // e.g. "/TelegramBot"
+    const folderPath = `${baseFolder}/${folderName}`;
+    const fileName = ".keep";
+
+    const uploadUrl = `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(
+      ONEDRIVE_USER
+    )}/drive/root:${folderPath}/${fileName}:/content`;
+
+    const res = await fetch(uploadUrl, {
+      method: "PUT",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/octet-stream",
+      },
+      body: buffer,
+    });
+
+    const data = await res.json();
+    if (!res.ok) {
+      console.error(
+        "OneDrive mkdir error:",
+        JSON.stringify(data, null, 2),
+        "status:",
+        res.status,
+        res.statusText
+      );
+      throw new Error("Failed to create folder");
+    } else {
+      console.log("Created OneDrive folder via .keep:", folderPath);
+    }
+  } catch (err) {
+    console.error("Failed to create OneDrive folder:", err);
+    throw err;
+  }
+}
+
 // ----- Webhook setup (non-blocking) -----
 
 async function ensureWebhook() {
@@ -531,8 +606,8 @@ async function ensureWebhook() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ url: WEBHOOK_URL }),
     });
-      const data = await res.json();
-      console.log("setWebhook response:", data);
+    const data = await res.json();
+    console.log("setWebhook response:", data);
   } catch (err) {
     console.error("Failed to set Telegram webhook:", err);
   }
