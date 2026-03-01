@@ -77,7 +77,7 @@ app.post("/save", async (req, res) => {
       ONEDRIVE_CLIENT_SECRET &&
       ONEDRIVE_USER
     ) {
-      await uploadFileToOneDrive(filePath, filename);
+      await uploadFileToOneDrive(filePath, filename, "global", "scripts");
     }
 
     return res.status(200).json({ ok: true, path: filePath });
@@ -113,7 +113,7 @@ app.post(WEBHOOK_PATH, async (req, res) => {
     const chatId = message.chat.id;
     const text = (message.text || "").trim();
 
-    // ---- /mkdir command to create a folder in OneDrive ----
+    // ---- /mkdir command: create a folder in OneDrive under this chat ----
     if (text.toLowerCase().startsWith("/mkdir")) {
       const parts = text.split(" ").filter(Boolean);
       if (parts.length < 2) {
@@ -130,10 +130,10 @@ app.post(WEBHOOK_PATH, async (req, res) => {
         .replace(/[^\w.\-]/g, "_");
 
       try {
-        await createOneDriveFolder(folderName);
+        await createOneDriveFolder(folderName, chatId);
         await sendTelegramMessage(
           chatId,
-          `Created folder \`${folderName}\` in OneDrive under \`${ONEDRIVE_FOLDER_PATH}\`.`
+          `Created folder \`${folderName}\` in OneDrive under \`${ONEDRIVE_FOLDER_PATH}/chat_${chatId}\`.`
         );
       } catch (err) {
         await sendTelegramMessage(
@@ -145,7 +145,36 @@ app.post(WEBHOOK_PATH, async (req, res) => {
       return res.sendStatus(200);
     }
 
-    // Simple recall example for teacher's name
+    // ---- /remember command: recall last memory matching a keyword ----
+    if (text.toLowerCase().startsWith("/remember")) {
+      const parts = text.split(" ").filter(Boolean);
+      if (parts.length < 2) {
+        await sendTelegramMessage(
+          chatId,
+          "Usage: /remember <keyword> (e.g. /remember teacher)"
+        );
+        return res.sendStatus(200);
+      }
+
+      const keyword = parts.slice(1).join(" ");
+      const recalled = recallFromLog(keyword, null);
+
+      if (recalled) {
+        await sendTelegramMessage(
+          chatId,
+          `Last thing I noted about "${keyword}" was: ${recalled}`
+        );
+      } else {
+        await sendTelegramMessage(
+          chatId,
+          `I don't have anything about "${keyword}" saved yet.`
+        );
+      }
+
+      return res.sendStatus(200);
+    }
+
+    // Simple recall example for teacher's name (shortcut)
     if (
       text.toLowerCase() === "what's my teacher's name?" ||
       text.toLowerCase() === "whats my teacher's name?" ||
@@ -174,7 +203,7 @@ app.post(WEBHOOK_PATH, async (req, res) => {
       const originalName = doc.file_name || `${fileId}.bin`;
 
       try {
-        const localPath = await downloadTelegramFile(fileId, originalName);
+        const localPath = await downloadTelegramFile(fileId, originalName, chatId);
         await sendTelegramMessage(
           chatId,
           `I saved your file as \`${path.basename(localPath)}\` on the server.`
@@ -197,7 +226,7 @@ app.post(WEBHOOK_PATH, async (req, res) => {
       const originalName = `photo_${fileId}.jpg`;
 
       try {
-        const localPath = await downloadTelegramFile(fileId, originalName);
+        const localPath = await downloadTelegramFile(fileId, originalName, chatId);
         await sendTelegramMessage(
           chatId,
           `I saved your photo as \`${path.basename(localPath)}\` on the server.`
@@ -251,7 +280,7 @@ app.post(WEBHOOK_PATH, async (req, res) => {
         ONEDRIVE_CLIENT_SECRET &&
         ONEDRIVE_USER
       ) {
-        await uploadFileToOneDrive(logFile, "messages.log");
+        await uploadFileToOneDrive(logFile, "messages.log", chatId, "logs");
       }
     } catch (err) {
       console.error("Failed to append to log file:", err);
@@ -335,15 +364,7 @@ function recallFromLog(keyword, preferredCategory = null) {
       const msg = match[1];
 
       if (msg.toLowerCase().includes(keyword.toLowerCase())) {
-        // naive pattern: "... is Name"
-        const isIndex = msg.toLowerCase().indexOf(" is ");
-        if (isIndex !== -1) {
-          const afterIs = msg.slice(isIndex + 4).trim();
-          const firstWord = afterIs.split(/\s+/)[0];
-          if (firstWord && /^[A-Z]/.test(firstWord)) {
-            return firstWord;
-          }
-        }
+        return msg;
       }
     }
     return null;
@@ -432,7 +453,7 @@ async function askPerplexity(prompt) {
 
 // ----- Telegram file download helper -----
 
-async function downloadTelegramFile(fileId, suggestedName) {
+async function downloadTelegramFile(fileId, suggestedName, chatId) {
   const getFileUrl = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getFile?file_id=${fileId}`;
 
   const metaRes = await fetch(getFileUrl);
@@ -469,7 +490,7 @@ async function downloadTelegramFile(fileId, suggestedName) {
     ONEDRIVE_CLIENT_SECRET &&
     ONEDRIVE_USER
   ) {
-    await uploadFileToOneDrive(localPath, safeName);
+    await uploadFileToOneDrive(localPath, safeName, chatId, "scripts");
   }
 
   return localPath;
@@ -513,18 +534,25 @@ async function getOneDriveAccessToken() {
   return data.access_token;
 }
 
-async function uploadFileToOneDrive(localPath, remoteFileName) {
+// Upload into /TelegramBot/chat_<chatId>/<kind>/<remoteFileName>
+async function uploadFileToOneDrive(localPath, remoteFileName, chatId, kind = "scripts") {
   try {
     if (!ONEDRIVE_USER) {
       throw new Error("ONEDRIVE_USER not set");
+    }
+    if (!chatId) {
+      throw new Error("chatId is required for uploadFileToOneDrive");
     }
 
     const token = await getOneDriveAccessToken();
     const fileBuffer = fs.readFileSync(localPath);
 
+    const baseFolder = ONEDRIVE_FOLDER_PATH; // e.g. "/TelegramBot"
+    const folderPath = `${baseFolder}/chat_${chatId}/${kind}`;
+
     const uploadUrl = `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(
       ONEDRIVE_USER
-    )}/drive/root:${ONEDRIVE_FOLDER_PATH}/${remoteFileName}:/content`;
+    )}/drive/root:${folderPath}/${remoteFileName}:/content`;
 
     const res = await fetch(uploadUrl, {
       method: "PUT",
@@ -552,16 +580,17 @@ async function uploadFileToOneDrive(localPath, remoteFileName) {
   }
 }
 
-// Create a OneDrive folder via .keep file
-async function createOneDriveFolder(folderName) {
+// Create a OneDrive folder via .keep file under /TelegramBot/chat_<chatId>/<folderName>
+async function createOneDriveFolder(folderName, chatId) {
   try {
     if (!ONEDRIVE_USER) throw new Error("ONEDRIVE_USER not set");
+    if (!chatId) throw new Error("chatId is required for createOneDriveFolder");
 
     const token = await getOneDriveAccessToken();
     const buffer = Buffer.from("folder placeholder");
 
     const baseFolder = ONEDRIVE_FOLDER_PATH; // e.g. "/TelegramBot"
-    const folderPath = `${baseFolder}/${folderName}`;
+    const folderPath = `${baseFolder}/chat_${chatId}/${folderName}`;
     const fileName = ".keep";
 
     const uploadUrl = `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(
